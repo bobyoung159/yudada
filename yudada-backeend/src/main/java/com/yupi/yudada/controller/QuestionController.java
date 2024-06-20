@@ -7,6 +7,7 @@ import com.yupi.yudada.common.BaseResponse;
 import com.yupi.yudada.common.DeleteRequest;
 import com.yupi.yudada.common.ErrorCode;
 import com.yupi.yudada.common.ResultUtils;
+import com.yupi.yudada.config.VipSchedulerConfig;
 import com.yupi.yudada.constant.UserConstant;
 import com.yupi.yudada.exception.BusinessException;
 import com.yupi.yudada.exception.ThrowUtils;
@@ -59,6 +60,9 @@ public class QuestionController {
 
     @Resource
     private AiManager aiManager;
+
+    @Resource
+    private Scheduler vipScheduler;
 
     // region 增删改查
 
@@ -354,6 +358,63 @@ public class QuestionController {
                     if(c == '}'){
                         counter.addAndGet(-1);
                         if(counter.get()==0){
+                            sseEmitter.send(JSONUtil.toJsonStr(stringBuilder.toString()));
+                            stringBuilder.setLength(0);
+                        }
+                    }
+                })
+                .doOnError((item)->log.error("sse error",item))
+                .doOnComplete(sseEmitter::complete)
+                .subscribe();
+        return sseEmitter;
+    }
+
+    @GetMapping("/ai_generate/sse/test")
+    public SseEmitter aiGenerateQuestionSSETest(AiGenerateQuestionRequest aiGenerateQuestionRequest, boolean isVip){
+        ThrowUtils.throwIf(aiGenerateQuestionRequest==null,ErrorCode.PARAMS_ERROR);
+        //获取参数
+        Long appId = aiGenerateQuestionRequest.getAppId();
+        int questionNumber = aiGenerateQuestionRequest.getQuestionNumber();
+        int optionNumber = aiGenerateQuestionRequest.getOptionNumber();
+        // 获取应用信息
+        App app = appService.getById(appId);
+        ThrowUtils.throwIf(app == null,ErrorCode.PARAMS_ERROR);
+        //封装prompt
+        String use = getGenerateQuestionUserMessage(app, questionNumber, optionNumber);
+        SseEmitter sseEmitter = new SseEmitter(0L);
+        //AI生成,流式返回
+        Flowable<ModelData> modelDataFlowable = aiManager.doStreamRequest(GENERATE_QUESTION_SYSTEM_MESSAGE,use,null);
+        //左括号计数器
+        AtomicInteger counter = new AtomicInteger(0);
+        StringBuilder stringBuilder = new StringBuilder();
+        //默认全局线程池
+        Scheduler scheduler = Schedulers.single();
+        if(isVip){
+            scheduler = vipScheduler;
+        }
+        modelDataFlowable   //Flowable类型的对象，表示数据流
+                .observeOn(scheduler) //表示下游操作应该在Schedulers.io这个调度器上进行
+                .map(modelData->modelData.getChoices().get(0).getDelta().getContent())
+                .map(message -> message.replace("\\s",""))
+                .filter(StringUtils::isNotBlank)
+                .flatMap(message->{  //flatMap会将流中的每个元素转换成一个新的流，并将这个这些流转换为单独流
+                    List<Character> list = new ArrayList<>();
+                    for (char c : message.toCharArray()) {
+                        list.add(c);
+                    }
+                    return Flowable.fromIterable(list);
+                })
+                .doOnNext(c->{ //每个元素发送前执行的操作
+                    if('{' == c){
+                        counter.addAndGet(1);
+                    }
+                    if(counter.get()>0){
+                        stringBuilder.append(c);
+                    }
+                    if(c == '}'){
+                        counter.addAndGet(-1);
+                        if(counter.get()==0){
+                            System.out.println(Thread.currentThread().getName());
                             sseEmitter.send(JSONUtil.toJsonStr(stringBuilder.toString()));
                             stringBuilder.setLength(0);
                         }
